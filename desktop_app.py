@@ -1,5 +1,7 @@
 import tkinter as tk
+from tkinter import filedialog
 from tkinter import ttk, messagebox
+from tkhtmlview import HTMLLabel
 import schwabdev
 import pandas as pd
 import numpy as np
@@ -8,6 +10,8 @@ import datetime
 import tempfile, os, webbrowser
 from math import log, sqrt, exp
 from scipy.stats import norm    
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # === Schwab credentials ===
 APP_KEY = ""        # your Schwab app key
@@ -16,9 +20,305 @@ CALLBACK_URL = "https://127.0.0.1"
 
 client = schwabdev.Client(APP_KEY, SECRET, CALLBACK_URL)
 
+def load_csv_index():
+    """
+    Loads csv index options from local CSV file and inserts
+    the results into the same data structures as Schwab live options.
+    """
+    global exp_data_map, current_symbol, current_price
+
+    symbol = index_symbol_var.get()
+
+    # Determine file source
+    if csv_mode_var.get() == "Default File":
+        filename = f"{symbol.lower()}_quotedata.csv"
+    else:
+        filename = filedialog.askopenfilename(
+            title=f"Select {symbol} CSV File",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if not filename:
+            messagebox.showwarning("Cancelled", "No CSV file selected.")
+            return
+
+    try:
+        with open(filename, "r") as f:
+            lines = f.readlines()
+    except Exception as e:
+        messagebox.showerror("File Error", f"Could not read CSV file:\n{e}")
+        return
+
+    # --- Parse Spot Price (Line 2 in CBOE format) ---
+    try:
+        spotLine = lines[1]
+        current_price = float(spotLine.split("Last:")[1].split(",")[0])
+    except:
+        current_price = 0.0
+
+    # Update UI
+    current_symbol = symbol + " (CSV)"
+    price_var.set(f"Price: ${current_price:.2f}")
+
+    # --- Parse Options Table starting at row 4 ---
+    try:
+        df = pd.read_csv(filename, sep=",", header=None, skiprows=4)
+    except Exception as e:
+        messagebox.showerror("CSV Error", f"Unable to parse CSV:\n{e}")
+        return
+
+    df.columns = [
+        'ExpirationDate','Calls','CallLastSale','CallNet','CallBid','CallAsk','CallVol',
+        'CallIV','CallDelta','CallGamma','CallOpenInt',
+        'Strike','Puts','PutLastSale','PutNet','PutBid','PutAsk','PutVol',
+        'PutIV','PutDelta','PutGamma','PutOpenInt'
+    ]
+
+    # Convert numeric fields
+    for col in ["Strike","CallIV","PutIV","CallDelta","PutDelta",
+                "CallGamma","PutGamma","CallOpenInt","PutOpenInt"]:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Convert expiration formats
+    df["ExpirationDate"] = pd.to_datetime(df["ExpirationDate"], errors="coerce")
+
+    # Rebuild expiration list (Schwab-style keys)
+    exp_data_map = {}
+    expirations = []
+
+    for exp_date, group in df.groupby("ExpirationDate"):
+        if pd.isna(exp_date):
+            continue
+
+        exp_key = exp_date.strftime("%Y-%m-%d") + ":0"
+        expirations.append(exp_key)
+
+        # Build standard schema expected by the rest of the system
+        clean_df = pd.DataFrame({
+            "Strike": group["Strike"],
+            "Bid_Call": group["CallBid"].replace(0, "N/A"),
+            "Ask_Call": group["CallAsk"].replace(0, "N/A"),
+            "Delta_Call": group["CallDelta"],
+            "Theta_Call": np.zeros(len(group)),     # CSV does not contain theta → set 0
+            "Gamma_Call": group["CallGamma"],
+            "IV_Call": group["CallIV"],
+            "OI_Call": group["CallOpenInt"],
+
+            "Bid_Put": group["PutBid"].replace(0, "N/A"),
+            "Ask_Put": group["PutAsk"].replace(0, "N/A"),
+            "Delta_Put": group["PutDelta"],
+            "Theta_Put": np.zeros(len(group)),      # CSV lacks theta → set 0
+            "Gamma_Put": group["PutGamma"],
+            "IV_Put": group["PutIV"],
+            "OI_Put": group["PutOpenInt"],
+        })
+
+        exp_data_map[exp_key] = clean_df.sort_values("Strike")
+
+    # Update expiration dropdown
+    exp_dropdown["values"] = expirations
+    exp_var.set(expirations[0])
+
+    # Update table UI
+    update_table(exp_var.get())
+    stats_btn.config(state="normal")
+    messagebox.showinfo("CSV Loaded", f"{symbol} index options loaded successfully.")
+
+
+def show_timed_message(title, message, duration_ms):
+    # Use your existing global root window
+    global root  
+
+    dialog = tk.Toplevel(root)
+    dialog.title(title)
+    dialog.geometry("300x100")
+    dialog.resizable(False, False)
+
+    dialog.update_idletasks()
+
+    # Center on screen
+    screen_w = dialog.winfo_screenwidth()
+    screen_h = dialog.winfo_screenheight()
+    win_w = dialog.winfo_width()
+    win_h = dialog.winfo_height()
+
+    x = (screen_w // 2) - (win_w // 2)
+    y = (screen_h // 2) - (win_h // 2)
+    dialog.geometry(f"{win_w}x{win_h}+{x}+{y}")
+
+    ttk.Label(dialog, text=message, wraplength=280).pack(
+        expand=True, fill="both", padx=10, pady=10
+    )
+    dialog.update_idletasks()
+    dialog.update()
+
+    dialog.after(duration_ms, dialog.destroy)
+
+    dialog.transient(root)
+    dialog.grab_set()
+    # root.wait_window(dialog)
+
 exp_data_map = {}
 current_symbol = ""
 current_price = 0.0
+
+def open_stats_breakdown():
+    global exp_data_map, current_price
+
+    selected_exp = exp_var.get()
+    if selected_exp not in exp_data_map:
+        messagebox.showwarning("No Data", "No data for this expiration.")
+        return
+
+    df = exp_data_map[selected_exp]
+    if df.empty:
+        messagebox.showwarning("Empty", "No option data loaded.")
+        return
+
+    # === Replace blanks with zero ===
+    df_num = df.replace("", 0.0)
+
+    # === Time to expiration (days extracted from "YYYY-MM-DD:XX") ===
+    try:
+        exp_date_str = selected_exp.split(":")[0]
+        exp_date = datetime.datetime.strptime(exp_date_str, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        T = max((exp_date - today).days / 365, 1/365)
+    except:
+        T = 7/365  # fallback
+
+    r = 0.05
+    q = 0.015
+    CONTRACT_MULT = 100
+
+    # === Black-Scholes Vega ===
+    def bs_vega(S, K, T, r, q, sigma):
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+            return 0.0
+        d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+        vega = S * np.exp(-q*T) * norm.pdf(d1) * np.sqrt(T)
+        return vega * CONTRACT_MULT
+
+    # === Compute totals ===
+    total_call_oi = df_num["OI_Call"].sum()
+    total_put_oi  = df_num["OI_Put"].sum()
+
+    total_call_gamma = df_num["Gamma_Call"].sum()
+    total_put_gamma  = df_num["Gamma_Put"].sum()
+
+    total_call_delta = df_num["Delta_Call"].sum()
+    total_put_delta  = df_num["Delta_Put"].sum()
+
+    # Real model-based Vega
+    call_vega_list = []
+    put_vega_list  = []
+
+    for _, row in df_num.iterrows():
+        strike = float(row["Strike"])
+        iv_call = float(row["IV_Call"])
+        iv_put  = float(row["IV_Put"])
+
+        call_vega_list.append(bs_vega(current_price, strike, T, r, q, iv_call))
+        put_vega_list.append(bs_vega(current_price, strike, T, r, q, iv_put))
+
+    total_call_vega = np.sum(call_vega_list)
+    total_put_vega  = np.sum(put_vega_list)
+
+    # IV-weighted PCR
+    total_call_iv = df_num["IV_Call"].sum()
+    total_put_iv  = df_num["IV_Put"].sum()
+
+    # Theta totals
+    total_call_theta = df_num["Theta_Call"].sum()
+    total_put_theta  = df_num["Theta_Put"].sum()
+
+    def safe_ratio(a, b):
+        return (a / b) if b != 0 else 0.0
+
+    # === Standard Ratios ===
+    pcr = safe_ratio(total_put_oi, total_call_oi)
+    pcr_gamma = safe_ratio(total_put_gamma, total_call_gamma)
+    pcr_delta = safe_ratio(total_put_delta, total_call_delta)
+    pcr_vega  = safe_ratio(total_put_vega, total_call_vega)
+
+    # === Weighted Ratios ===
+    pcr_theta = safe_ratio(total_put_theta, total_call_theta)
+    pcr_iv    = safe_ratio(total_put_iv,   total_call_iv)
+
+    weighted_pcr_gamma = safe_ratio(total_put_gamma * total_put_oi,
+                                    total_call_gamma * total_call_oi)
+
+    weighted_pcr_vega = safe_ratio(total_put_vega * total_put_oi,
+                                   total_call_vega * total_call_oi)
+
+    # === Prepare table data ===
+    stats_sections = [
+        ("STANDARD RATIOS", [
+            ("Put/Call OI Ratio", f"{pcr:.3f}"),
+            ("PCR x Gamma",        f"{pcr_gamma:.3f}"),
+            ("PCR x Delta",        f"{pcr_delta:.3f}"),
+            ("PCR x Vega",         f"{pcr_vega:.3f}"),
+        ]),
+
+        ("WEIGHTED RATIOS", [
+            ("PCR x Theta",        f"{pcr_theta:.3f}"),
+            ("PCR x IV",           f"{pcr_iv:.3f}"),
+            ("Weighted PCR Gamma",     f"{weighted_pcr_gamma:.3f}"),
+            ("Weighted PCR Vega",  f"{weighted_pcr_vega:.3f}"),
+        ])
+    ]
+
+    # === Build window ===
+    win = tk.Toplevel(root)
+    win.title(f"{current_symbol} Stats Breakdown — {selected_exp}")
+    win.geometry("520x420")
+
+    header = tk.Label(
+        win,
+        text=f"{current_symbol} Stats Breakdown\nExpiration: {selected_exp}",
+        font=("Arial", 15, "bold")
+    )
+    header.pack(pady=10)
+
+    table_frame = tk.Frame(win)
+    table_frame.pack(pady=10)
+
+    row_index = 0
+
+    # Build table row-by-row
+    for section_title, rows in stats_sections:
+        # Section header
+        tk.Label(
+            table_frame,
+            text=section_title,
+            font=("Arial", 12, "bold"),
+            fg="#333"
+        ).grid(row=row_index, column=0, columnspan=2, pady=(10, 5))
+        row_index += 1
+
+        for metric, value in rows:
+            bg_color = "#F4F4F4" if row_index % 2 == 0 else "#FFFFFF"
+
+            tk.Label(
+                table_frame,
+                text=metric,
+                font=("Arial", 11),
+                bg=bg_color,
+                width=28,
+                anchor="w"
+            ).grid(row=row_index, column=0, padx=10, pady=2)
+
+            tk.Label(
+                table_frame,
+                text=value,
+                font=("Arial", 11, "bold"),
+                bg=bg_color,
+                width=12,
+                anchor="e"
+            ).grid(row=row_index, column=1, padx=10, pady=2)
+
+            row_index += 1
+
+
 
 # === Black-Scholes Gamma (with dividend yield) ===
 def bs_gamma(S, K, T, r, q, sigma):
@@ -43,29 +343,29 @@ def fetch_option_chain(symbol):
         data = resp.json()
 
                 # === DEBUG: print just one option sample ===
-        print(f"\n=== DEBUG: Raw OptionChain keys for {symbol} ===")
-        print("Available keys:", list(data.keys()))
+        # print(f"\n=== DEBUG: Raw OptionChain keys for {symbol} ===")
+        # print("Available keys:", list(data.keys()))
 
         # Print one sample call & put entry if available
         calls = data.get("callExpDateMap", {})
         puts = data.get("putExpDateMap", {})
 
-        if calls:
-            first_exp = next(iter(calls))
-            first_strike = next(iter(calls[first_exp]))
-            print("\nSample CALL JSON:")
-            print(calls[first_exp][first_strike][0])
-        else:
-            print("No calls found.")
+        # if calls:
+        #     first_exp = next(iter(calls))
+        #     first_strike = next(iter(calls[first_exp]))
+        #     print("\nSample CALL JSON:")
+        #     print(calls[first_exp][first_strike][0])
+        # else:
+        #     print("No calls found.")
 
-        if puts:
-            first_exp = next(iter(puts))
-            first_strike = next(iter(puts[first_exp]))
-            print("\nSample PUT JSON:")
-            print(puts[first_exp][first_strike][0])
-        else:
-            print("No puts found.")
-        print("=== END DEBUG ===\n")
+        # if puts:
+        #     first_exp = next(iter(puts))
+        #     first_strike = next(iter(puts[first_exp]))
+        #     print("\nSample PUT JSON:")
+        #     print(puts[first_exp][first_strike][0])
+        # else:
+        #     print("No puts found.")
+        # print("=== END DEBUG ===\n")
         
         all_expirations = sorted(set(list(calls.keys()) + list(puts.keys())))
 
@@ -155,6 +455,26 @@ def toggle_sidebar():
 toggle_btn = tk.Button(root, text="☰ Hide Menu", command=toggle_sidebar)
 toggle_btn.pack(anchor=tk.NW)
 
+tk.Label(sidebar_frame, text="Chart Output:", bg="#2b2b2b", fg="white").pack(pady=5)
+chart_output_var = tk.StringVar(value="Desktop")
+chart_output_dropdown = ttk.Combobox(
+    sidebar_frame,
+    textvariable=chart_output_var,
+    values=["Browser", "Desktop"],
+    state="readonly",
+    width=10
+)
+chart_output_dropdown.pack(pady=5)
+
+stats_btn = tk.Button(
+    sidebar_frame,
+    text="Get Stats Breakdown",
+    command=lambda: open_stats_breakdown(),
+    state="disabled"
+)
+stats_btn.pack(pady=5, padx=10, fill=tk.X)
+
+
 tk.Label(sidebar_frame, text="Tools", bg="#2b2b2b", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
 update_gamma_btn = tk.Button(sidebar_frame, text="Generate Gamma Chart", command=lambda: generate_gamma_chart())
 update_gamma_btn.pack(pady=5, padx=10, fill=tk.X)
@@ -188,7 +508,7 @@ def on_fetch():
     if not symbol:
         messagebox.showwarning("Input required", "Please enter a stock symbol.")
         return
-    messagebox.showinfo("Fetching", f"Fetching option chain for {symbol}...")
+    show_timed_message("Fetching...", f"Fetched Data for {symbol} complete", 3000)
     current_symbol = symbol
 
     current_price = fetch_stock_price(symbol)
@@ -206,10 +526,11 @@ def on_fetch():
     else:
         exp_var.set(expirations[0])
     update_table(exp_var.get())
+    stats_btn.config(state="normal")
 
 def auto_refresh_price():
     global current_symbol, current_price
-    if current_symbol:
+    if current_symbol and "(CSV)" not in current_symbol:
         new_price = fetch_stock_price(current_symbol)
         if new_price > 0:
             diff = new_price - current_price
@@ -221,7 +542,7 @@ def auto_refresh_price():
 
 def auto_refresh_options():
     global exp_data_map, current_symbol
-    if current_symbol:
+    if current_symbol and "(CSV)" not in current_symbol:
         exp_data_map, expirations = fetch_option_chain(current_symbol)
         if expirations:
             previous_exp = exp_var.get()
@@ -235,6 +556,42 @@ def auto_refresh_options():
 
 fetch_btn = tk.Button(top_frame, text="Fetch Options", command=on_fetch)
 fetch_btn.pack(side=tk.LEFT, padx=5)
+
+# --- Separator ---
+tk.Label(top_frame, text=" | ", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
+
+# --- CSV Index Controls ---
+tk.Label(top_frame, text="CSV Index:").pack(side=tk.LEFT, padx=5)
+
+index_symbol_var = tk.StringVar()
+index_dropdown = ttk.Combobox(
+    top_frame,
+    textvariable=index_symbol_var,
+    state="readonly",
+    values=["SPX", "NDX"],
+    width=6
+)
+index_dropdown.pack(side=tk.LEFT, padx=5)
+index_dropdown.set("SPX")
+
+# CSV Load Mode Selector
+csv_mode_var = tk.StringVar(value="Default File")
+csv_mode_dropdown = ttk.Combobox(
+    top_frame,
+    textvariable=csv_mode_var,
+    state="readonly",
+    values=["Default File", "Choose CSV File"],
+    width=14
+)
+csv_mode_dropdown.pack(side=tk.LEFT, padx=5)
+
+# Fetch Index Button
+fetch_index_btn = tk.Button(
+    top_frame,
+    text="Fetch CS Index",
+    command=lambda: load_csv_index()
+)
+fetch_index_btn.pack(side=tk.LEFT, padx=5)
 
 # === Table ===
 cols = [
@@ -320,11 +677,14 @@ def generate_gamma_chart():
     total_gex = df_plot["Exposure"].sum() / 1e9
     df_plot["Exposure_Bn"] = df_plot["Exposure"] / 1e9
 
+    min_strike = df_plot["Strike"].min()
+    max_strike = df_plot["Strike"].max()
+
     chart = (
         alt.Chart(df_plot)
         .mark_bar(size=14)
         .encode(
-            x=alt.X("Strike:Q", title="Strike Price"),
+            x=alt.X("Strike:Q", title="Strike Price", scale=alt.Scale(domain=[min_strike, max_strike])),
             y=alt.Y("Exposure_Bn:Q", title="Spot Gamma Exposure ($ billions / 1% move)", scale=alt.Scale(domainMid=0)),
             color=alt.Color("Type:N", scale=alt.Scale(domain=["CALL", "PUT"], range=["green", "red"]))
         )
@@ -341,8 +701,134 @@ def generate_gamma_chart():
 
     html_path = os.path.join(tempfile.gettempdir(), f"{current_symbol}_{selected_exp.replace(':','-')}_gamma.html")
     chart.save(html_path)
-    webbrowser.open(f"file://{html_path}")
-    messagebox.showinfo("Gamma Chart", "Gamma chart generated and opened in browser.")
+    mode = chart_output_var.get()
+
+    if mode == "Browser":
+        webbrowser.open(f"file://{html_path}")
+        show_timed_message("Gamma Chart Created", "Gamma chart opened in browser.", 3000)
+        # messagebox.showinfo("Gamma Chart", "Gamma chart opened in browser.")
+        return
+    elif mode == "Desktop":
+        win = tk.Toplevel(root)
+        win.title(f"{current_symbol} Gamma Exposure - {selected_exp}")
+        win.geometry("950x700")
+
+        df_calls = df_plot[df_plot["Type"] == "CALL"].sort_values("Strike")
+        df_puts  = df_plot[df_plot["Type"] == "PUT"].sort_values("Strike")
+
+        # === Auto-scale using min/max strikes ===
+        strikes = df_plot["Strike"].sort_values().unique()
+        min_strike = strikes.min()
+        max_strike = strikes.max()
+
+        even_start = int(min_strike + (min_strike % 2))    # next even ≥ min_strike
+        even_end   = int(max_strike - (max_strike % 2))    # last even ≤ max_strike
+
+        even_ticks = list(range(even_start, even_end + 1, 2))
+
+        unique_strikes = sorted(df_plot["Strike"].unique())
+        if len(unique_strikes) > 1:
+            spacing = unique_strikes[1] - unique_strikes[0]
+        else:
+            spacing = 1
+
+        # Dynamic bar width — normalized across different strike densities
+        # These proportions make SPX, NDX, SPY, QQQ, TSLA all look consistent
+        if spacing <= 1:
+            bar_width = spacing * 0.7    # typical equity options
+        elif spacing <= 2.5:
+            bar_width = spacing * 0.55   # some ETF chains
+        elif spacing <= 5:
+            bar_width = spacing * 0.35   # SPX/NDX weekly strikes (5-wide)
+        else:
+            bar_width = spacing * 0.25   # Large increment strikes (25-wide)
+
+        fig = Figure(figsize=(9, 6), dpi=100)
+        ax = fig.add_subplot(111)
+
+        # === Plot CALLS (green) ===
+        ax.bar(
+            df_calls["Strike"],
+            df_calls["Exposure_Bn"],
+            width=bar_width,
+            color="#2ECC71",
+            edgecolor="black",
+            linewidth=0.6,
+            label="CALL"
+        )
+
+        ax.bar(
+            df_puts["Strike"],
+            df_puts["Exposure_Bn"],
+            width=bar_width,
+            color="#E74C3C",
+            edgecolor="black",
+            linewidth=0.6,
+            label="PUT"
+        )
+        # Zero line
+        ax.axhline(0, color="black", linewidth=1)
+
+        # Labels and title
+        ax.set_title(f"{current_symbol} Gamma Exposure ({selected_exp.split(':')[0]})", fontsize=14)
+        fig.suptitle("Model: Black–Scholes (S² × 0.01 scaling)", fontsize=11, y=0.98)
+
+        ax.set_xlabel("Strike Price", fontsize=12)
+        ax.set_ylabel("Gamma Exposure (Bn)", fontsize=12)
+
+        # === X-axis tick marks every 2 strikes ===
+        # --- Determine natural strike spacing ---
+        unique_strikes = sorted(df_plot["Strike"].unique())
+        if len(unique_strikes) > 1:
+            spacing = unique_strikes[1] - unique_strikes[0]
+        else:
+            spacing = 1
+
+        # --- Decide tick interval based on spacing ---
+        if spacing <= 1:
+            tick_interval = 2
+        elif spacing <= 2.5:
+            tick_interval = 5
+        elif spacing <= 5:
+            tick_interval = 10
+        else:
+            tick_interval = spacing * 2
+
+        # --- Generate clean ticks ---
+        min_s = min(unique_strikes)
+        max_s = max(unique_strikes)
+
+        # Round to nearest interval
+        start_tick = (int(min_s) // tick_interval) * tick_interval
+        end_tick   = (int(max_s + tick_interval) // tick_interval) * tick_interval
+
+        tick_list = list(range(start_tick, end_tick + tick_interval, tick_interval))
+
+        ax.set_xticks(tick_list)
+
+        # ax.set_xticks(even_ticks)
+
+        # Avoid scientific notation
+        ax.ticklabel_format(style='plain', axis='x')
+
+        # === Apply scaled limits ===
+        ax.set_xlim(min_strike, max_strike)
+
+        # Cleaner grid (Altair-like)
+        ax.grid(axis="y", linestyle="--", alpha=0.35)
+
+        # Legend
+        ax.legend()
+
+        # Embed into Tkinter
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # show_timed_message("Gamma Chart", "Gamma chart opened in new Tkinter window.", 7000)
+        return
 
 # === Start Refresh Loops ===
 auto_refresh_price()
