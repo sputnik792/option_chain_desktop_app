@@ -14,8 +14,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # === Schwab credentials ===
-APP_KEY = ""        # your Schwab app key
-SECRET = ""           # your Schwab secret
+APP_KEY = "NWy77tZSfVAMzZBMkZ6HBoliNH7NX6Rh"        # your Schwab app key
+SECRET = "448aaPGZUahJKaMv"           # your Schwab secret
 CALLBACK_URL = "https://127.0.0.1"
 
 client = schwabdev.Client(APP_KEY, SECRET, CALLBACK_URL)
@@ -191,7 +191,7 @@ def open_stats_breakdown():
     CONTRACT_MULT = 100
 
     # === Black-Scholes Vega ===
-    def bs_vega(S, K, T, r, q, sigma):
+    def bs_vega_with_mult(S, K, T, r, q, sigma):
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
             return 0.0
         d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
@@ -217,8 +217,8 @@ def open_stats_breakdown():
         iv_call = float(row["IV_Call"])
         iv_put  = float(row["IV_Put"])
 
-        call_vega_list.append(bs_vega(current_price, strike, T, r, q, iv_call))
-        put_vega_list.append(bs_vega(current_price, strike, T, r, q, iv_put))
+        call_vega_list.append(bs_vega_with_mult(current_price, strike, T, r, q, iv_call))
+        put_vega_list.append(bs_vega_with_mult(current_price, strike, T, r, q, iv_put))
 
     total_call_vega = np.sum(call_vega_list)
     total_put_vega  = np.sum(put_vega_list)
@@ -320,7 +320,7 @@ def open_stats_breakdown():
 
 
 
-# === Black-Scholes Gamma (with dividend yield) ===
+# === Black-Scholes Algorithms (with dividend yield) ===
 def bs_gamma(S, K, T, r, q, sigma):
     try:
         if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -330,6 +330,44 @@ def bs_gamma(S, K, T, r, q, sigma):
         return gamma
     except Exception:
         return 0.0
+    
+def bs_vanna(S, K, T, r, q, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return np.exp(-q*T) * norm.pdf(d1) * d2 / sigma
+
+def bs_vega(S, K, T, r, q, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*np.sqrt(T))
+    return S * np.exp(-q*T) * norm.pdf(d1) * np.sqrt(T)
+
+def bs_volga(S, K, T, r, q, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    vega = bs_vega(S, K, T, r, q, sigma)
+    return vega * d1 * d2 / sigma
+
+def bs_charm(S, K, T, r, q, sigma):
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma*sigma)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    term1 = q * np.exp(-q*T) * norm.cdf(d1)
+    term2 = np.exp(-q*T) * norm.pdf(d1)
+    term3 = (2*(r-q)*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
+    return term1 - term2 * term3
+
+EXPOSURE_MODELS = {
+    "Gamma":  lambda S,K,T,r,q,sigma: bs_gamma(S,K,T,r,q,sigma),
+    "Vanna":  lambda S,K,T,r,q,sigma: bs_vanna(S,K,T,r,q,sigma),
+    "Volga":  lambda S,K,T,r,q,sigma: bs_volga(S,K,T,r,q,sigma),
+    "Charm":  lambda S,K,T,r,q,sigma: bs_charm(S,K,T,r,q,sigma),
+}
 
 # === Fetch Option Chain ===
 def fetch_option_chain(symbol):
@@ -474,9 +512,29 @@ stats_btn = tk.Button(
 )
 stats_btn.pack(pady=5, padx=10, fill=tk.X)
 
+model_btn = tk.Menubutton(sidebar_frame, text="Exposure Model", relief=tk.RAISED)
+model_menu = tk.Menu(model_btn, tearoff=0)
+model_btn.config(menu=model_menu)
+
+# Submenu: Black-Scholes
+bs_menu = tk.Menu(model_menu, tearoff=0)
+model_menu.add_cascade(label="Black-Scholes", menu=bs_menu)
+
+# Model variable
+selected_model_var = tk.StringVar(value="Gamma")
+
+# Add items
+for greek in ["Gamma", "Vanna", "Volga", "Charm"]:
+    bs_menu.add_radiobutton(
+        label=greek,
+        variable=selected_model_var,
+        value=greek
+    )
+
+model_btn.pack(pady=5, padx=10, fill=tk.X)
 
 tk.Label(sidebar_frame, text="Tools", bg="#2b2b2b", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
-update_gamma_btn = tk.Button(sidebar_frame, text="Generate Gamma Chart", command=lambda: generate_gamma_chart())
+update_gamma_btn = tk.Button(sidebar_frame, text="Generate Chart", command=lambda: generate_selected_chart())
 update_gamma_btn.pack(pady=5, padx=10, fill=tk.X)
 
 # === Main Frame ===
@@ -633,7 +691,7 @@ def on_exp_change(event):
 exp_dropdown.bind("<<ComboboxSelected>>", on_exp_change)
 
 # === Gamma Chart ===
-def generate_gamma_chart():
+def generate_selected_chart():
     if not current_symbol:
         messagebox.showwarning("Missing", "Please fetch a symbol first.")
         return
@@ -653,26 +711,63 @@ def generate_gamma_chart():
     T = 7 / 365  # ~1 week default
     gamma_data = []
 
+    model_name = selected_model_var.get()
+    model_func = EXPOSURE_MODELS[model_name]
+
     for _, row in df.iterrows():
         strike = float(row.get("Strike", 0) or 0)
         if strike <= 0:
             continue
 
         iv_call = float(row.get("IV_Call", 0) or 0.2)
-        iv_put = float(row.get("IV_Put", 0) or 0.2)
+        iv_put  = float(row.get("IV_Put", 0) or 0.2)
         oi_call = float(row.get("OI_Call", 0) or 1)
-        oi_put = float(row.get("OI_Put", 0) or 1)
+        oi_put  = float(row.get("OI_Put", 0) or 1)
 
-        gamma_call = bs_gamma(current_price, strike, T, r, q, iv_call)
-        gamma_put = bs_gamma(current_price, strike, T, r, q, iv_put)
+        # --- Compute raw Greek values ---
+        call_val = model_func(current_price, strike, T, r, q, iv_call)
+        put_val  = model_func(current_price, strike, T, r, q, iv_put)
 
-        # === Correct CBOE-style exposure scaling ===
-        gex_call = gamma_call * oi_call * CONTRACT_MULTIPLIER * (current_price ** 2) * 0.01
-        gex_put = -gamma_put * oi_put * CONTRACT_MULTIPLIER * (current_price ** 2) * 0.01
+        # -----------------------------
+        # APPLY MODEL-SPECIFIC SCALING
+        # -----------------------------
+        if model_name == "Gamma":
+            scale_call = oi_call * CONTRACT_MULTIPLIER * (current_price**2) * 0.01
+            scale_put  = oi_put  * CONTRACT_MULTIPLIER * (current_price**2) * 0.01
 
-        gamma_data.append({"Strike": strike, "Type": "CALL", "Exposure": gex_call})
-        gamma_data.append({"Strike": strike, "Type": "PUT", "Exposure": gex_put})
+            exp_call = call_val * scale_call
+            exp_put  = -put_val * scale_put   # ONLY Gamma gets sign flip
 
+        elif model_name == "Vanna":
+            scale_call = oi_call * CONTRACT_MULTIPLIER * current_price * iv_call
+            scale_put  = oi_put  * CONTRACT_MULTIPLIER * current_price * iv_put
+
+            exp_call = abs(call_val * scale_call)
+            exp_put  = -abs(put_val * scale_put)    # NO sign flip
+
+        elif model_name == "Volga":
+            vega_call = bs_vega(current_price, strike, T, r, q, iv_call)
+            vega_put  = bs_vega(current_price, strike, T, r, q, iv_put)
+
+            scale_call = oi_call * vega_call
+            scale_put  = oi_put  * vega_put
+
+            exp_call = abs(call_val * scale_call)
+            exp_put  = -abs(put_val * scale_put)  # NO sign flip
+
+        elif model_name == "Charm":
+            scale_call = oi_call * CONTRACT_MULTIPLIER * current_price
+            scale_put  = oi_put  * CONTRACT_MULTIPLIER * current_price
+
+            exp_call = abs(call_val * scale_call)
+            exp_put  = -abs(put_val * scale_put)  # NO sign flip
+
+        # Add to output list
+        gamma_data.append({"Strike": strike, "Type": "CALL", "Exposure": exp_call})
+        gamma_data.append({"Strike": strike, "Type": "PUT",  "Exposure": exp_put})
+
+
+    ### the scale is currently incorrect, it is just for gamma by default
     df_plot = pd.DataFrame(gamma_data)
     total_gex = df_plot["Exposure"].sum() / 1e9
     df_plot["Exposure_Bn"] = df_plot["Exposure"] / 1e9
@@ -685,14 +780,15 @@ def generate_gamma_chart():
         .mark_bar(size=14)
         .encode(
             x=alt.X("Strike:Q", title="Strike Price", scale=alt.Scale(domain=[min_strike, max_strike])),
-            y=alt.Y("Exposure_Bn:Q", title="Spot Gamma Exposure ($ billions / 1% move)", scale=alt.Scale(domainMid=0)),
+            y=alt.Y("Exposure_Bn:Q", title=f"Spot {model_name} Exposure (Bn)", scale=alt.Scale(domainMid=0)),
             color=alt.Color("Type:N", scale=alt.Scale(domain=["CALL", "PUT"], range=["green", "red"]))
         )
         .properties(
             title={
-                "text": [f"${current_symbol} Gamma Exposure ({selected_exp.split(':')[0]})"],
-                "subtitle": [f"Total Gamma: {total_gex:+.2f} Bn | Updated {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Black–Scholes, S²×0.01 scaling)"],
-                "fontSize": 18
+                "text": [f"${current_symbol} {model_name} Exposure ({selected_exp.split(':')[0]})"],
+                "subtitle": [
+                    f"Total {model_name}: {total_gex:+.2f} Bn | Updated {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Black–Scholes Model)"
+                ],
             },
             width=850,
             height=450
@@ -705,12 +801,12 @@ def generate_gamma_chart():
 
     if mode == "Browser":
         webbrowser.open(f"file://{html_path}")
-        show_timed_message("Gamma Chart Created", "Gamma chart opened in browser.", 3000)
+        show_timed_message("Chart Created", "Chart opened in browser.", 3000)
         # messagebox.showinfo("Gamma Chart", "Gamma chart opened in browser.")
         return
     elif mode == "Desktop":
         win = tk.Toplevel(root)
-        win.title(f"{current_symbol} Gamma Exposure - {selected_exp}")
+        win.title(f"{current_symbol} Chart - {selected_exp}")
         win.geometry("950x700")
 
         df_calls = df_plot[df_plot["Type"] == "CALL"].sort_values("Strike")
@@ -770,11 +866,12 @@ def generate_gamma_chart():
         ax.axhline(0, color="black", linewidth=1)
 
         # Labels and title
-        ax.set_title(f"{current_symbol} Gamma Exposure ({selected_exp.split(':')[0]})", fontsize=14)
-        fig.suptitle("Model: Black–Scholes (S² × 0.01 scaling)", fontsize=11, y=0.98)
+        ax.set_title(f"{current_symbol} {model_name} Exposure ({selected_exp.split(':')[0]})", fontsize=14)
+        fig.suptitle(f"Model: Black–Scholes ({model_name})", fontsize=11, y=0.98)
+
 
         ax.set_xlabel("Strike Price", fontsize=12)
-        ax.set_ylabel("Gamma Exposure (Bn)", fontsize=12)
+        ax.set_ylabel(f"{model_name} Exposure (Bn)", fontsize=12)
 
         # === X-axis tick marks every 2 strikes ===
         # --- Determine natural strike spacing ---
