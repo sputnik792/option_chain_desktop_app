@@ -14,8 +14,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 # === Schwab credentials ===
-APP_KEY = "NWy77tZSfVAMzZBMkZ6HBoliNH7NX6Rh"        # your Schwab app key
-SECRET = "448aaPGZUahJKaMv"           # your Schwab secret
+APP_KEY = ""        # your Schwab app key
+SECRET = ""           # your Schwab secret
 CALLBACK_URL = "https://127.0.0.1"
 
 client = schwabdev.Client(APP_KEY, SECRET, CALLBACK_URL)
