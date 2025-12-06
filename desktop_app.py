@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import ttk, messagebox
-from tkhtmlview import HTMLLabel
 import schwabdev
 import pandas as pd
 import numpy as np
@@ -619,7 +618,7 @@ fetch_btn.pack(side=tk.LEFT, padx=5)
 tk.Label(top_frame, text=" | ", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
 
 # --- CSV Index Controls ---
-tk.Label(top_frame, text="CSV Index:").pack(side=tk.LEFT, padx=5)
+tk.Label(top_frame, text="CS Index:").pack(side=tk.LEFT, padx=5)
 
 index_symbol_var = tk.StringVar()
 index_dropdown = ttk.Combobox(
