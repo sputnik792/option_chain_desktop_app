@@ -2,8 +2,10 @@ import tkinter as tk
 from tkinter import filedialog
 from tkinter import ttk, messagebox
 import schwabdev
+import threading
 import pandas as pd
 import numpy as np
+import json
 import altair as alt
 import datetime
 import tempfile, os, webbrowser
@@ -18,6 +20,34 @@ SECRET = ""           # your Schwab secret
 CALLBACK_URL = "https://127.0.0.1"
 
 client = schwabdev.Client(APP_KEY, SECRET, CALLBACK_URL)
+
+# === Multi-symbol state ===
+MAX_TICKERS = 10
+# === Preset ticker persistence ===
+PRESET_FILE = "preset_tickers.json"
+
+def load_preset_tickers():
+    if os.path.exists(PRESET_FILE):
+        try:
+            with open(PRESET_FILE, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [s.upper() for s in data][:MAX_TICKERS]
+        except Exception as e:
+            print(f"Failed to load presets: {e}")
+    return ["SPY"]  # fallback default
+
+def save_preset_tickers(tickers):
+    try:
+        with open(PRESET_FILE, "w") as f:
+            json.dump(tickers, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save presets: {e}")
+
+preset_tickers = load_preset_tickers()  # default
+ticker_tabs = {}           # symbol -> tab widgets
+ticker_data = {}           # symbol -> {exp_data_map, current_price}
+
 
 def load_csv_index():
     """
@@ -467,228 +497,6 @@ def fetch_stock_price(symbol):
         messagebox.showwarning("Quote Error", f"Could not fetch quote for {symbol}: {e}")
         return 0.0
 
-# === GUI Setup ===
-root = tk.Tk()
-root.title("Schwab Option Chain Dashboard")
-root.geometry("1400x750")
-
-sidebar_visible = True
-sidebar_frame = tk.Frame(root, bg="#2b2b2b", width=200)
-sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
-
-def toggle_sidebar():
-    global sidebar_visible
-    if sidebar_visible:
-        sidebar_frame.pack_forget()
-        toggle_btn.config(text="☰ Show Menu")
-        sidebar_visible = False
-    else:
-        main_frame.pack_forget()
-        sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
-        main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        toggle_btn.config(text="☰ Hide Menu")
-        sidebar_visible = True
-
-toggle_btn = tk.Button(root, text="☰ Hide Menu", command=toggle_sidebar)
-toggle_btn.pack(anchor=tk.NW)
-
-tk.Label(sidebar_frame, text="Chart Output:", bg="#2b2b2b", fg="white").pack(pady=5)
-chart_output_var = tk.StringVar(value="Desktop")
-chart_output_dropdown = ttk.Combobox(
-    sidebar_frame,
-    textvariable=chart_output_var,
-    values=["Browser", "Desktop"],
-    state="readonly",
-    width=10
-)
-chart_output_dropdown.pack(pady=5)
-
-stats_btn = tk.Button(
-    sidebar_frame,
-    text="Get Stats Breakdown",
-    command=lambda: open_stats_breakdown(),
-    state="disabled"
-)
-stats_btn.pack(pady=5, padx=10, fill=tk.X)
-
-model_btn = tk.Menubutton(sidebar_frame, text="Exposure Model", relief=tk.RAISED)
-model_menu = tk.Menu(model_btn, tearoff=0)
-model_btn.config(menu=model_menu)
-
-# Submenu: Black-Scholes
-bs_menu = tk.Menu(model_menu, tearoff=0)
-model_menu.add_cascade(label="Black-Scholes", menu=bs_menu)
-
-# Model variable
-selected_model_var = tk.StringVar(value="Gamma")
-
-# Add items
-for greek in ["Gamma", "Vanna", "Volga", "Charm"]:
-    bs_menu.add_radiobutton(
-        label=greek,
-        variable=selected_model_var,
-        value=greek
-    )
-
-model_btn.pack(pady=5, padx=10, fill=tk.X)
-
-tk.Label(sidebar_frame, text="Tools", bg="#2b2b2b", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
-update_gamma_btn = tk.Button(sidebar_frame, text="Generate Chart", command=lambda: generate_selected_chart())
-update_gamma_btn.pack(pady=5, padx=10, fill=tk.X)
-
-# === Main Frame ===
-main_frame = tk.Frame(root)
-main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-# Top controls
-top_frame = tk.Frame(main_frame)
-top_frame.pack(pady=10)
-
-tk.Label(top_frame, text="Stock Symbol:").pack(side=tk.LEFT, padx=5)
-symbol_entry = tk.Entry(top_frame, width=10)
-symbol_entry.pack(side=tk.LEFT, padx=5)
-symbol_entry.insert(0, "SPY")
-
-price_var = tk.StringVar(value="—")
-price_label = tk.Label(top_frame, textvariable=price_var, fg="blue", font=("Arial", 12, "bold"))
-price_label.pack(side=tk.LEFT, padx=10)
-
-tk.Label(top_frame, text="Expiration:").pack(side=tk.LEFT, padx=5)
-exp_var = tk.StringVar()
-exp_dropdown = ttk.Combobox(top_frame, textvariable=exp_var, state="readonly", width=25)
-exp_dropdown.pack(side=tk.LEFT, padx=5)
-
-# === Fetch options ===
-def on_fetch():
-    global exp_data_map, current_symbol, current_price
-    symbol = symbol_entry.get().strip().upper()
-    if not symbol:
-        messagebox.showwarning("Input required", "Please enter a stock symbol.")
-        return
-    show_timed_message("Fetching...", f"Fetched Data for {symbol} complete", 3000)
-    current_symbol = symbol
-
-    current_price = fetch_stock_price(symbol)
-    price_var.set(f"Price: ${current_price:.2f}" if current_price else "Price: —")
-
-    exp_data_map, expirations = fetch_option_chain(symbol)
-    if not expirations:
-        messagebox.showwarning("No data", f"No option data returned for {symbol}.")
-        return
-
-    previous_exp = exp_var.get()
-    exp_dropdown["values"] = expirations
-    if previous_exp in expirations:
-        exp_var.set(previous_exp)
-    else:
-        exp_var.set(expirations[0])
-    update_table(exp_var.get())
-    stats_btn.config(state="normal")
-
-def auto_refresh_price():
-    global current_symbol, current_price
-    if current_symbol and "(CSV)" not in current_symbol:
-        new_price = fetch_stock_price(current_symbol)
-        if new_price > 0:
-            diff = new_price - current_price
-            current_price = new_price
-            color = "green" if diff > 0 else "red" if diff < 0 else "blue"
-            price_var.set(f"Price: ${current_price:.2f}")
-            price_label.config(fg=color)
-    root.after(10000, auto_refresh_price)
-
-def auto_refresh_options():
-    global exp_data_map, current_symbol
-    if current_symbol and "(CSV)" not in current_symbol:
-        exp_data_map, expirations = fetch_option_chain(current_symbol)
-        if expirations:
-            previous_exp = exp_var.get()
-            exp_dropdown["values"] = expirations
-            if previous_exp in expirations:
-                exp_var.set(previous_exp)
-            else:
-                exp_var.set(expirations[0])
-            update_table(exp_var.get())
-    root.after(120000, auto_refresh_options)
-
-fetch_btn = tk.Button(top_frame, text="Fetch Options", command=on_fetch)
-fetch_btn.pack(side=tk.LEFT, padx=5)
-
-# --- Separator ---
-tk.Label(top_frame, text=" | ", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
-
-# --- CSV Index Controls ---
-tk.Label(top_frame, text="CS Index:").pack(side=tk.LEFT, padx=5)
-
-index_symbol_var = tk.StringVar()
-index_dropdown = ttk.Combobox(
-    top_frame,
-    textvariable=index_symbol_var,
-    state="readonly",
-    values=["SPX", "NDX"],
-    width=6
-)
-index_dropdown.pack(side=tk.LEFT, padx=5)
-index_dropdown.set("SPX")
-
-# CSV Load Mode Selector
-csv_mode_var = tk.StringVar(value="Default File")
-csv_mode_dropdown = ttk.Combobox(
-    top_frame,
-    textvariable=csv_mode_var,
-    state="readonly",
-    values=["Default File", "Choose CSV File"],
-    width=14
-)
-csv_mode_dropdown.pack(side=tk.LEFT, padx=5)
-
-# Fetch Index Button
-fetch_index_btn = tk.Button(
-    top_frame,
-    text="Fetch CS Index",
-    command=lambda: load_csv_index()
-)
-fetch_index_btn.pack(side=tk.LEFT, padx=5)
-
-# === Table ===
-cols = [
-    "Bid_Call", "Ask_Call", "Delta_Call", "Theta_Call", "Gamma_Call", "IV_Call", "OI_Call",
-    "Strike",
-    "Bid_Put", "Ask_Put", "Delta_Put", "Theta_Put", "Gamma_Put", "IV_Put", "OI_Put"
-]
-headers = [
-    "Call Bid", "Call Ask", "Δ(Call)", "Θ(Call)", "Γ(Call)", "IV(Call)", "OI(Call)",
-    "Strike",
-    "Put Bid", "Put Ask", "Δ(Put)", "Θ(Put)", "Γ(Put)", "IV(Put)", "OI(Put)"
-]
-
-frame = tk.Frame(main_frame)
-frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-tree = ttk.Treeview(frame, columns=cols, show="headings")
-for c, h in zip(cols, headers):
-    tree.heading(c, text=h)
-    tree.column(c, width=100, anchor=tk.CENTER)
-
-vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-tree.configure(yscroll=vsb.set, xscroll=hsb.set)
-vsb.pack(side=tk.RIGHT, fill=tk.Y)
-hsb.pack(side=tk.BOTTOM, fill=tk.X)
-tree.pack(fill=tk.BOTH, expand=True)
-
-def update_table(selected_exp):
-    df = exp_data_map.get(selected_exp, pd.DataFrame())
-    tree.delete(*tree.get_children())
-    if not df.empty:
-        for _, row in df.iterrows():
-            vals = [row.get(c, "") for c in cols]
-            tree.insert("", tk.END, values=vals)
-
-def on_exp_change(event):
-    update_table(exp_var.get())
-
-exp_dropdown.bind("<<ComboboxSelected>>", on_exp_change)
-
 # === Gamma Chart ===
 def generate_selected_chart():
     if not current_symbol:
@@ -865,8 +673,8 @@ def generate_selected_chart():
         ax.axhline(0, color="black", linewidth=1)
 
         # Labels and title
-        ax.set_title(f"{current_symbol} {model_name} Exposure ({selected_exp.split(':')[0]})", fontsize=14)
-        fig.suptitle(f"Model: Black–Scholes ({model_name})", fontsize=11, y=0.98)
+        ax.set_title(f"{current_symbol} {model_name} Exposure ({exp_var.get().split(':')[0]})", fontsize=14)
+        fig.suptitle(f"Model: ({model_name})", fontsize=11, y=0.98)
 
 
         ax.set_xlabel("Strike Price", fontsize=12)
@@ -926,7 +734,430 @@ def generate_selected_chart():
         # show_timed_message("Gamma Chart", "Gamma chart opened in new Tkinter window.", 7000)
         return
 
+def generate_chart_group():
+    for symbol, ui in ticker_tabs.items():
+        # Ensure this ticker has data
+        if symbol not in ticker_data:
+            continue
+
+        selected_exp = ui["exp_var"].get()
+        if not selected_exp:
+            continue
+
+        # Inject per-ticker state
+        global current_symbol, current_price, exp_data_map, exp_var
+
+        current_symbol = symbol
+        current_price = ticker_data[symbol]["price"]
+        exp_data_map = ticker_data[symbol]["exp_data_map"]
+
+        # IMPORTANT: override exp_var with this tab’s expiration
+        exp_var.set(selected_exp)
+
+        generate_selected_chart()
+
+
+def edit_tickers():
+    win = tk.Toplevel(root)
+    win.title("Edit Preset Tickers")
+    win.geometry("300x250")
+
+    entries = []
+
+    for i in range(MAX_TICKERS):
+        var = tk.StringVar(value=preset_tickers[i] if i < len(preset_tickers) else "")
+        e = tk.Entry(win, textvariable=var)
+        e.pack(pady=4)
+        entries.append(var)
+
+    def save():
+        global preset_tickers
+        preset_tickers = [
+            v.get().strip().upper()
+            for v in entries
+            if v.get().strip()
+        ][:MAX_TICKERS]
+
+        save_preset_tickers(preset_tickers)
+        rebuild_tabs()
+        win.destroy()
+
+
+    tk.Button(win, text="Save", command=save).pack(pady=10)
+
+
+# === GUI Setup ===
+root = tk.Tk()
+root.title("Schwab Option Chain Dashboard")
+menubar = tk.Menu(root)
+root.config(menu=menubar)
+
+settings_menu = tk.Menu(menubar, tearoff=0)
+menubar.add_cascade(label="Settings", menu=settings_menu)
+settings_menu.add_command(label="Edit Preset Tickers", command=lambda: edit_tickers())
+root.geometry("1400x750")
+
+sidebar_visible = True
+sidebar_frame = tk.Frame(root, bg="#2b2b2b", width=200)
+sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
+
+def create_stock_tab(symbol):
+    tab = tk.Frame(notebook)
+    notebook.add(tab, text=symbol)
+
+    price_var = tk.StringVar(value="—")
+    exp_var = tk.StringVar()
+
+    top = tk.Frame(tab)
+    top.pack(pady=5)
+
+    tk.Label(top, text=f"{symbol} Price:").pack(side=tk.LEFT)
+    tk.Label(top, textvariable=price_var, fg="blue", font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=10)
+
+    tk.Label(top, text="Expiration:").pack(side=tk.LEFT)
+    exp_dropdown = ttk.Combobox(top, textvariable=exp_var, state="readonly", width=25)
+    exp_dropdown.pack(side=tk.LEFT, padx=5)
+
+    # === Table ===
+    frame = tk.Frame(tab)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    tree = ttk.Treeview(frame, columns=cols, show="headings")
+    for c, h in zip(cols, headers):
+        tree.heading(c, text=h)
+        tree.column(c, width=95, anchor=tk.CENTER)
+
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscroll=vsb.set)
+
+    vsb.pack(side=tk.RIGHT, fill=tk.Y)
+    tree.pack(fill=tk.BOTH, expand=True)
+
+    ticker_tabs[symbol] = {
+        "tab": tab,
+        "price_var": price_var,
+        "exp_var": exp_var,
+        "exp_dropdown": exp_dropdown,
+        "tree": tree
+    }
+
+
+def toggle_sidebar():
+    global sidebar_visible
+    if sidebar_visible:
+        sidebar_frame.pack_forget()
+        toggle_btn.config(text="☰ Show Menu")
+        sidebar_visible = False
+    else:
+        main_frame.pack_forget()
+        sidebar_frame.pack(side=tk.LEFT, fill=tk.Y)
+        main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        toggle_btn.config(text="☰ Hide Menu")
+        sidebar_visible = True
+
+toggle_btn = tk.Button(root, text="☰ Hide Menu", command=toggle_sidebar)
+toggle_btn.pack(anchor=tk.NW)
+
+tk.Label(sidebar_frame, text="Chart Output:", bg="#2b2b2b", fg="white").pack(pady=5)
+chart_output_var = tk.StringVar(value="Desktop")
+chart_output_dropdown = ttk.Combobox(
+    sidebar_frame,
+    textvariable=chart_output_var,
+    values=["Browser", "Desktop"],
+    state="readonly",
+    width=10
+)
+chart_output_dropdown.pack(pady=5)
+
+stats_btn = tk.Button(
+    sidebar_frame,
+    text="Get Stats Breakdown",
+    command=lambda: open_stats_breakdown(),
+    state="disabled"
+)
+stats_btn.pack(pady=5, padx=10, fill=tk.X)
+
+model_btn = tk.Menubutton(sidebar_frame, text="Exposure Model", relief=tk.RAISED)
+model_menu = tk.Menu(model_btn, tearoff=0)
+model_btn.config(menu=model_menu)
+
+# Submenu: Black-Scholes
+bs_menu = tk.Menu(model_menu, tearoff=0)
+model_menu.add_cascade(label="Black-Scholes", menu=bs_menu)
+
+# Model variable
+selected_model_var = tk.StringVar(value="Gamma")
+
+# Add items
+for greek in ["Gamma", "Vanna", "Volga", "Charm"]:
+    bs_menu.add_radiobutton(
+        label=greek,
+        variable=selected_model_var,
+        value=greek
+    )
+
+model_btn.pack(pady=5, padx=10, fill=tk.X)
+
+tk.Label(sidebar_frame, bg="#2b2b2b", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
+# tk.Label(sidebar_frame, text="Tools", bg="#2b2b2b", fg="white", font=("Arial", 12, "bold")).pack(pady=10)
+# update_gamma_btn = tk.Button(sidebar_frame, text="Generate Chart", command=lambda: generate_selected_chart())
+# update_gamma_btn.pack(pady=5, padx=10, fill=tk.X)
+
+# group_chart_btn = tk.Button(
+#     sidebar_frame,
+#     text="Generate Chart Group",
+#     command=generate_chart_group
+# )
+# group_chart_btn.pack(pady=5, padx=10, fill=tk.X)
+
+# === Fetch options ===
+def fetch_worker(symbol):
+    try:
+        price = fetch_stock_price(symbol)
+        exp_map, expirations = fetch_option_chain(symbol)
+
+        def update_ui():
+            # Store per-ticker data ONLY
+            ticker_data[symbol] = {
+                "exp_data_map": exp_map,
+                "price": price
+            }
+
+            ui = ticker_tabs.get(symbol)
+            if not ui:
+                return
+
+            # Update ONLY the tab price label
+            ui["price_var"].set(f"${price:.2f}")
+
+            if expirations:
+                ui["exp_dropdown"]["values"] = expirations
+                ui["exp_var"].set(expirations[0])
+                update_table_for_symbol(symbol, expirations[0])
+
+        root.after(0, update_ui)
+
+    except Exception as e:
+        print(f"Thread fetch failed for {symbol}: {e}")
+
+
+def fetch_all_stocks():
+    for symbol in preset_tickers:
+        t = threading.Thread(
+            target=fetch_worker,
+            args=(symbol,),
+            daemon=True
+        )
+        t.start()
+
+def on_fetch():
+    global exp_data_map, current_symbol, current_price
+    symbol = symbol_entry.get().strip().upper()
+    if not symbol:
+        messagebox.showwarning("Input required", "Please enter a stock symbol.")
+        return
+    show_timed_message("Fetching...", f"Fetched Data for {symbol} complete", 3000)
+    current_symbol = symbol
+
+    current_price = fetch_stock_price(symbol)
+    price_var.set(f"Price: ${current_price:.2f}" if current_price else "Price: —")
+
+    exp_data_map, expirations = fetch_option_chain(symbol)
+    if not expirations:
+        messagebox.showwarning("No data", f"No option data returned for {symbol}.")
+        return
+
+    previous_exp = exp_var.get()
+    exp_dropdown["values"] = expirations
+    if previous_exp in expirations:
+        exp_var.set(previous_exp)
+    else:
+        exp_var.set(expirations[0])
+    update_table(exp_var.get())
+    stats_btn.config(state="normal")
+
+# === Main Frame ===
+main_frame = tk.Frame(root)
+main_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+multi_top_frame = tk.Frame(main_frame)
+multi_top_frame.pack(fill=tk.X, pady=5)
+
+generate_group_btn = tk.Button(
+    multi_top_frame,
+    text="Generate Chart Group",
+    command=generate_chart_group
+)
+generate_group_btn.pack(side=tk.LEFT, padx=5)
+
+tk.Label(multi_top_frame, text=" | ", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
+
+fetch_all_btn = tk.Button(
+    multi_top_frame,
+    text="Fetch All",
+    command=fetch_all_stocks
+)
+fetch_all_btn.pack(side=tk.LEFT, padx=5)
+
+notebook = ttk.Notebook(main_frame)
+notebook.pack(fill=tk.BOTH, expand=True)
+
+# Bottom frame controls
+bottom_frame = tk.Frame(main_frame)
+bottom_frame.pack(pady=10)
+
+generate_chart_btn = tk.Button(
+    bottom_frame,
+    text="Generate Chart",
+    command=generate_selected_chart
+)
+generate_chart_btn.pack(side=tk.LEFT, padx=5)
+
+tk.Label(bottom_frame, text="Stock Symbol:").pack(side=tk.LEFT, padx=5)
+symbol_entry = tk.Entry(bottom_frame, width=10)
+fetch_single_btn = tk.Button(
+    bottom_frame,
+    text="Fetch Options",
+    command=on_fetch   # ← your original single-symbol logic
+)
+fetch_single_btn.pack(side=tk.LEFT, padx=5)
+
+symbol_entry.pack(side=tk.LEFT, padx=5)
+symbol_entry.insert(0, "SPY")
+
+price_var = tk.StringVar(value="—")
+price_label = tk.Label(bottom_frame, textvariable=price_var, fg="blue", font=("Arial", 12, "bold"))
+price_label.pack(side=tk.LEFT, padx=10)
+
+tk.Label(bottom_frame, text="Expiration:").pack(side=tk.LEFT, padx=5)
+exp_var = tk.StringVar()
+exp_dropdown = ttk.Combobox(bottom_frame, textvariable=exp_var, state="readonly", width=25)
+exp_dropdown.pack(side=tk.LEFT, padx=5)
+
+def auto_refresh_price():
+    global current_symbol, current_price
+    if current_symbol and "(CSV)" not in current_symbol:
+        new_price = fetch_stock_price(current_symbol)
+        if new_price > 0:
+            diff = new_price - current_price
+            current_price = new_price
+            color = "green" if diff > 0 else "red" if diff < 0 else "blue"
+            price_var.set(f"Price: ${current_price:.2f}")
+            price_label.config(fg=color)
+    root.after(10000, auto_refresh_price)
+
+def auto_refresh_options():
+    global exp_data_map, current_symbol
+    if current_symbol and "(CSV)" not in current_symbol:
+        exp_data_map, expirations = fetch_option_chain(current_symbol)
+        if expirations:
+            previous_exp = exp_var.get()
+            exp_dropdown["values"] = expirations
+            if previous_exp in expirations:
+                exp_var.set(previous_exp)
+            else:
+                exp_var.set(expirations[0])
+            update_table(exp_var.get())
+    root.after(120000, auto_refresh_options)
+
+# --- Separator ---
+tk.Label(bottom_frame, text=" | ", font=("Arial", 14, "bold")).pack(side=tk.LEFT, padx=10)
+
+# --- CSV Index Controls ---
+tk.Label(bottom_frame, text="CS Index:").pack(side=tk.LEFT, padx=5)
+
+index_symbol_var = tk.StringVar()
+index_dropdown = ttk.Combobox(
+    bottom_frame,
+    textvariable=index_symbol_var,
+    state="readonly",
+    values=["SPX", "NDX", "VIX"],
+    width=6
+)
+index_dropdown.pack(side=tk.LEFT, padx=5)
+index_dropdown.set("SPX")
+
+# CSV Load Mode Selector
+csv_mode_var = tk.StringVar(value="Default File")
+csv_mode_dropdown = ttk.Combobox(
+    bottom_frame,
+    textvariable=csv_mode_var,
+    state="readonly",
+    values=["Default File", "Choose CSV File"],
+    width=14
+)
+csv_mode_dropdown.pack(side=tk.LEFT, padx=5)
+
+# Fetch Index Button
+fetch_index_btn = tk.Button(
+    bottom_frame,
+    text="Fetch CS Index",
+    command=lambda: load_csv_index()
+)
+fetch_index_btn.pack(side=tk.LEFT, padx=5)
+
+# === Table ===
+cols = [
+    "Bid_Call", "Ask_Call", "Delta_Call", "Theta_Call", "Gamma_Call", "IV_Call", "OI_Call",
+    "Strike",
+    "Bid_Put", "Ask_Put", "Delta_Put", "Theta_Put", "Gamma_Put", "IV_Put", "OI_Put"
+]
+headers = [
+    "Call Bid", "Call Ask", "Δ(Call)", "Θ(Call)", "Γ(Call)", "IV(Call)", "OI(Call)",
+    "Strike",
+    "Put Bid", "Put Ask", "Δ(Put)", "Θ(Put)", "Γ(Put)", "IV(Put)", "OI(Put)"
+]
+
+frame = tk.Frame(main_frame)
+frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+tree = ttk.Treeview(frame, columns=cols, show="headings")
+for c, h in zip(cols, headers):
+    tree.heading(c, text=h)
+    tree.column(c, width=100, anchor=tk.CENTER)
+
+vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+vsb.pack(side=tk.RIGHT, fill=tk.Y)
+hsb.pack(side=tk.BOTTOM, fill=tk.X)
+tree.pack(fill=tk.BOTH, expand=True)
+
+def update_table(selected_exp):
+    df = exp_data_map.get(selected_exp, pd.DataFrame())
+    tree.delete(*tree.get_children())
+    if not df.empty:
+        for _, row in df.iterrows():
+            vals = [row.get(c, "") for c in cols]
+            tree.insert("", tk.END, values=vals)
+
+def update_table_for_symbol(symbol, selected_exp):
+    ui = ticker_tabs[symbol]
+    tree = ui["tree"]
+    tree.delete(*tree.get_children())
+
+    df = ticker_data[symbol]["exp_data_map"].get(selected_exp)
+    if df is not None:
+        for _, row in df.iterrows():
+            tree.insert("", tk.END, values=[row.get(c, "") for c in cols])
+
+def on_exp_change(event):
+    update_table(exp_var.get())
+
+exp_dropdown.bind("<<ComboboxSelected>>", on_exp_change)
+
+    
+
 # === Start Refresh Loops ===
+def rebuild_tabs():
+    for tab in notebook.tabs():
+        notebook.forget(tab)
+
+    ticker_tabs.clear()
+
+    for symbol in preset_tickers:
+        create_stock_tab(symbol)
+
+rebuild_tabs()
 auto_refresh_price()
 auto_refresh_options()
 root.mainloop()
